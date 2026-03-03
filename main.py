@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""
-PlutoSDR VNA Pro – Time-Domain Edition
-======================================
-• Plots S11 and S21 vs Elapsed Time at a Central Frequency
-• Start/Stop toggle + Pause/Resume functionality
-• Dynamic point-by-point Metadata logging
-• Visual vertical markers on plot when metadata changes
-• Auto-saves CSV and PNG upon stopping the scan
-"""
 
-# ───────────── imports ─────────────
 import sys, os, time, traceback
 from datetime import datetime
 import numpy as np
@@ -27,7 +17,6 @@ from PyQt6.QtWidgets import (
     QFrame, QMessageBox, QCheckBox, QComboBox)
 from PyQt6.QtCore import QThread, pyqtSignal
 
-# ───────────── configuration constants ─────────────
 FILTER_MODE, FFT_METHOD = 'fft', 'fftconvolve'
 FILT_RIPPLE_DB, FILT_CUTOFF_HZ, FILT_TRANS_WIDTH_HZ = 70, 500, 100
 SMOOTH_WIN21, SMOOTH_WIN11 = 7, 5
