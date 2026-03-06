@@ -2,6 +2,7 @@
 
 import sys, os, time, traceback
 from datetime import datetime
+from queue import Queue, Empty
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -10,20 +11,20 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import (
     NavigationToolbar2QT, FigureCanvasQTAgg as FigureCanvas)
 import adi
-from scipy.signal import kaiserord, firwin, lfilter, fftconvolve, oaconvolve
+from scipy.signal import kaiserord, firwin, lfilter, fftconvolve, oaconvolve, savgol_filter
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel,
     QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit,
     QFrame, QMessageBox, QCheckBox, QComboBox)
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal, QTimer
 
 FILTER_MODE, FFT_METHOD = 'fft', 'fftconvolve'
 FILT_RIPPLE_DB, FILT_CUTOFF_HZ, FILT_TRANS_WIDTH_HZ = 70, 500, 100
-SMOOTH_WIN21, SMOOTH_WIN11 = 7, 5
+SMOOTH_WIN21, SMOOTH_WIN11 = 15, 15
 SDR_URI = "ip:192.168.2.1"
 FS, NUM_S, TONE = 8e6, 2**18, 543e3
 RF_F = 4e6
-DWELL, CLR_READS, EPS = 0.1, 1, 1e-15
+CLR_READS, EPS = 1, 1e-15
 MIN_FREQ, MAX_FREQ = 0.3e9, 3e9
 DEFAULT_CENTER_FREQ = 1e9
 
@@ -62,17 +63,20 @@ def lockin(buf: np.ndarray) -> float:
         return 0.0
     t = np.arange(len(buf)) / FS
     y = apply_filter(buf * np.exp(-2j * np.pi * TONE * t))
-    y = y[N//2:]  # discard FIR transient
+    y = y[N//2:]  
     return np.abs(y).mean()
 
 def to_dB(x):
     return 20 * np.log10(np.maximum(x, EPS))
-
-def smooth_trace(y, k):
+    
+def gaussian_trace(y, k, std=None):
     if k <= 1 or y.size < k:
         return y
+    if std is None:
+        std = max(k / 6.0, 1.0) 
+    n = np.arange(k) - (k - 1) / 2.0
+    win = np.exp(-0.5 * (n / std) ** 2)
     mask = np.isfinite(y).astype(float)
-    win = np.ones(k)
     num = np.convolve(np.nan_to_num(y), win, 'same')
     den = np.convolve(mask, win, 'same')
     out = np.full_like(y, np.nan)
@@ -80,17 +84,29 @@ def smooth_trace(y, k):
     out[good] = num[good] / den[good]
     return out
 
-# ───────────── worker thread ─────────────
-class TimeSweepThread(QThread):
-    update  = pyqtSignal(float, float, float) # (time, s21, s11)
-    started = pyqtSignal()
-    error   = pyqtSignal(str)
+def savgol_trace(y, k):
+    window_length = int(k)
+    if window_length % 2 == 0:
+        window_length += 1
+    polyorder = min(3, window_length - 1)
+    if y.size < window_length or polyorder < 1:
+        return y
+    # Modified: Now applies SavGol to the raw data instead of Gaussian data
+    return savgol_filter(np.nan_to_num(y), window_length, polyorder)
 
-    def __init__(self, dev):
+
+# ───────────── Threads ─────────────
+class SdrAcquisitionThread(QThread):
+    """Reads raw buffers from the SDR and pushes them to a thread-safe queue."""
+    started_acq = pyqtSignal()
+    error       = pyqtSignal(str)
+
+    def __init__(self, dev, data_queue):
         super().__init__()
-        self.dev       = dev
-        self.center_f  = DEFAULT_CENTER_FREQ
-        self.stop_flag = True
+        self.dev        = dev
+        self.data_queue = data_queue
+        self.center_f   = DEFAULT_CENTER_FREQ
+        self.stop_flag  = True
         self.pause_flag = False
 
     def set_freq(self, f):
@@ -109,7 +125,7 @@ class TimeSweepThread(QThread):
             raise
 
     def run(self):
-        self.started.emit()
+        self.started_acq.emit()
         f = self.center_f
         NUM_R = 4 if f < 1e9 else 1
 
@@ -120,8 +136,7 @@ class TimeSweepThread(QThread):
             self.stop_flag = True
             return
 
-        time.sleep(0.5) # Let PLL settle
-        
+        time.sleep(0.5)
         start_time = time.time()
         total_pause_time = 0.0
         is_paused_internal = False
@@ -139,7 +154,7 @@ class TimeSweepThread(QThread):
                     total_pause_time += (time.time() - pause_start)
                     is_paused_internal = False
 
-            time.sleep(DWELL)
+            # Clear stale buffers
             for _ in range(CLR_READS):
                 self._safe_rx()
 
@@ -151,33 +166,72 @@ class TimeSweepThread(QThread):
                 acc0[j*NUM_S:(j+1)*NUM_S] = (r[0]/2**12) * 7
                 acc1[j*NUM_S:(j+1)*NUM_S] = (r[1]/2**12) * 7
 
+            t_elapsed = time.time() - start_time - total_pause_time
+            
+            # Block if the computation thread is falling behind
+            # This prevents infinite memory growth and keeps data in sync
+            self.data_queue.put((t_elapsed, acc0, acc1))
+
+
+class ComputeThread(QThread):
+    """Pulls buffers from the queue, runs lock-in math, and emits results to UI."""
+    update = pyqtSignal(float, float, float)
+
+    def __init__(self, data_queue):
+        super().__init__()
+        self.data_queue = data_queue
+        self.stop_flag  = True
+
+    def stop(self):
+        self.stop_flag = True
+
+    def run(self):
+        while not self.stop_flag:
+            try:
+                # Timeout allows the thread to periodically check stop_flag
+                t_elapsed, acc0, acc1 = self.data_queue.get(timeout=0.1)
+            except Empty:
+                continue
+                
             s21 = to_dB(lockin(acc0))
             s11 = to_dB(lockin(acc1))
 
             if not np.isnan(s11) and s11 > 0:
                 s11 = 0.0
 
-            t_elapsed = time.time() - start_time - total_pause_time
             self.update.emit(t_elapsed, s21, s11)
+
 
 # ───────────── GUI ─────────────
 class VNA(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PlutoSDR VNA Pro – Time Domain")
+        self.setWindowTitle("PlutoSDR VNA Pro – Time Domain (Multithreaded)")
         
         self.meta_obj = "NO"
         self.meta_height = 0.0
-        self.last_t = 0.0 # Track the current time for the marker
+        self.last_t = 0.0
         self.meta_lines = []
+        
+        # Thread communication queue. Size 5 is enough to buffer spikes without huge lag.
+        self.data_queue = Queue(maxsize=5)
 
         self._build_ui()
         self._init_plot()
         
-        self.wk = TimeSweepThread(sdr)
-        self.wk.update.connect(self._update)
-        self.wk.started.connect(self._reset)
-        self.wk.error.connect(lambda m: QMessageBox.critical(self, "Worker error", m))
+        # Setup threads
+        self.acq_thread = SdrAcquisitionThread(sdr, self.data_queue)
+        self.comp_thread = ComputeThread(self.data_queue)
+        
+        self.acq_thread.started_acq.connect(self._reset)
+        self.acq_thread.error.connect(lambda m: QMessageBox.critical(self, "Hardware Error", m))
+        
+        # Decouple plot updates from data arrival to prevent UI freezing at high speeds
+        self.comp_thread.update.connect(self._store_data)
+        
+        self.plot_timer = QTimer()
+        self.plot_timer.timeout.connect(self._update_plot)
+        self.plot_timer.setInterval(50) # Update plot at 20 FPS
 
     def _build_ui(self):
         cw = QWidget()
@@ -227,15 +281,20 @@ class VNA(QMainWindow):
         h.addStretch()
 
         h.addWidget(QLabel("Show:"))
-        self.cbSmooth = QCheckBox("Smoothed")
-        self.cbSmooth.setChecked(True)
-        h.addWidget(self.cbSmooth)
+        self.cbSavGol = QCheckBox("SavGol")
+        self.cbSavGol.setChecked(True)
+        h.addWidget(self.cbSavGol)
+
+        self.cbGaussian = QCheckBox("Gaussian")
+        self.cbGaussian.setChecked(True)
+        h.addWidget(self.cbGaussian)
         
         self.cbRaw = QCheckBox("Raw")
         self.cbRaw.setChecked(True)
         h.addWidget(self.cbRaw)
         
-        self.cbSmooth.stateChanged.connect(self._vis_toggle)
+        self.cbSavGol.stateChanged.connect(self._vis_toggle)
+        self.cbGaussian.stateChanged.connect(self._vis_toggle)
         self.cbRaw.stateChanged.connect(self._vis_toggle)
 
         v.addWidget(top)
@@ -249,10 +308,13 @@ class VNA(QMainWindow):
         self.x_time, self.y21r, self.y11r = [], [], []
         self.obj_history, self.height_history = [], []
 
-        self.l21, = self.ax21.plot([], [], 'b-', lw=1.2, label='S21 smoothed')
-        self.d21, = self.ax21.plot([], [], 'ro', ms=4,   label='S21 raw')
-        self.l11, = self.ax11.plot([], [], 'g-', lw=1.2, label='S11 smoothed')
-        self.d11, = self.ax11.plot([], [], 'mo', ms=4,   label='S11 raw')
+        self.l21, = self.ax21.plot([], [], 'b-', lw=1.2, label='S21 SavGol')
+        self.g21, = self.ax21.plot([], [], 'c-', lw=1.5, label='S21 Gaussian')
+        self.d21, = self.ax21.plot([], [], 'ro', ms=4,   label='S21 Raw')
+        
+        self.l11, = self.ax11.plot([], [], 'g-', lw=1.2, label='S11 SavGol')
+        self.g11, = self.ax11.plot([], [], 'orange', lw=1.5, label='S11 Gaussian')
+        self.d11, = self.ax11.plot([], [], 'mo', ms=4,   label='S11 Raw')
 
         self.ax21.set_title("S21 vs Time")
         self.ax11.set_title("S11 vs Time")
@@ -265,28 +327,27 @@ class VNA(QMainWindow):
 
         for ax in (self.ax21, self.ax11):
             ax.grid(True)
+            ax.legend(loc='lower right')
 
         self.canvas.mpl_connect('button_press_event', self._on_click)
         self.markers = []
         self._vis_toggle()
+        self._needs_plot_update = False
 
     def save_metadata(self, quiet=False):
         try:
             new_obj = self.combo_obj.currentText()
             new_height = float(self.le_height.text())
             
-            # Check if values actually changed
             is_changed = (new_obj != self.meta_obj) or (new_height != self.meta_height)
             
             self.meta_obj = new_obj
             self.meta_height = new_height
             
-            # Draw a visual marker if a change occurred during an active scan
-            if is_changed and not self.wk.stop_flag and self.last_t > 0:
+            if is_changed and not self.acq_thread.stop_flag and self.last_t > 0:
                 l1 = self.ax21.axvline(x=self.last_t, color='orange', linestyle='--', alpha=0.8)
                 l2 = self.ax11.axvline(x=self.last_t, color='orange', linestyle='--', alpha=0.8)
                 
-                # Transform to keep text at the top of the axes regardless of Y-scale
                 t1 = self.ax21.text(self.last_t, 0.95, ' Meta', color='orange', rotation=90, 
                                     transform=self.ax21.get_xaxis_transform(), va='top', ha='right', fontsize=8)
                 t2 = self.ax11.text(self.last_t, 0.95, ' Meta', color='orange', rotation=90, 
@@ -310,11 +371,11 @@ class VNA(QMainWindow):
             return
 
         dt_str = datetime.now().strftime("%d-%H%M%S")
-        cf_hz = self.wk.center_f
+        cf_hz = self.acq_thread.center_f
         cf_mhz = cf_hz / 1e6
         cf_ghz = cf_hz / 1e9
 
-        base_dir = "VNA"
+        base_dir = "VKA"
         sub_dir = os.path.join(base_dir, f"{int(cf_mhz)}MHz")
         os.makedirs(sub_dir, exist_ok=True)
 
@@ -342,7 +403,7 @@ class VNA(QMainWindow):
             QMessageBox.critical(self, "Export Error", f"Failed to save files:\n{e}")
 
     def toggle_scan(self):
-        if self.wk.stop_flag:
+        if self.acq_thread.stop_flag:
             self.start_scan()
         else:
             self.stop_scan()
@@ -366,17 +427,32 @@ class VNA(QMainWindow):
         self.ax11.set_title(f"S11 vs Time ({cf/1e6} MHz)")
         self.canvas.draw()
 
-        self.wk.set_freq(cf)
-        self.wk.stop_flag = False
-        self.wk.pause_flag = False
+        # Clear queue and start threads
+        while not self.data_queue.empty():
+            try: self.data_queue.get_nowait()
+            except Empty: break
+
+        self.acq_thread.set_freq(cf)
+        self.acq_thread.stop_flag = False
+        self.acq_thread.pause_flag = False
+        self.comp_thread.stop_flag = False
+
         self.btn_pause.setText("Pause")
-        self.wk.start()
+        self.plot_timer.start()
+        self.comp_thread.start()
+        self.acq_thread.start()
         
     def stop_scan(self):
-        was_running = not self.wk.stop_flag
+        was_running = not self.acq_thread.stop_flag
         
-        self.wk.stop()
-        self.wk.wait()
+        self.acq_thread.stop()
+        self.comp_thread.stop()
+        
+        self.acq_thread.wait()
+        self.comp_thread.wait()
+        self.plot_timer.stop()
+        
+        self._update_plot() # Force one last plot render
         
         self.btn_toggle_scan.setText("Start Scan")
         self.btn_pause.setEnabled(False)
@@ -387,13 +463,13 @@ class VNA(QMainWindow):
             self.export_data(auto=True)
 
     def toggle_pause(self):
-        if self.wk.stop_flag:
+        if self.acq_thread.stop_flag:
             return
             
         self.save_metadata(quiet=True)
             
-        self.wk.pause_flag = not self.wk.pause_flag
-        if self.wk.pause_flag:
+        self.acq_thread.pause_flag = not self.acq_thread.pause_flag
+        if self.acq_thread.pause_flag:
             self.btn_pause.setText("Resume")
         else:
             self.btn_pause.setText("Pause")
@@ -403,7 +479,7 @@ class VNA(QMainWindow):
         self.x_time.clear(); self.y21r.clear(); self.y11r.clear()
         self.obj_history.clear(); self.height_history.clear()
         
-        for ln in (self.l21, self.d21, self.l11, self.d11):
+        for ln in (self.l21, self.g21, self.d21, self.l11, self.g11, self.d11):
             ln.set_data([], [])
             
         for line in self.meta_lines:
@@ -415,8 +491,10 @@ class VNA(QMainWindow):
         self.ax21.set_xlim(0, 10)
         self.ax11.set_xlim(0, 10)
         self.canvas.draw()
+        self._needs_plot_update = False
 
-    def _update(self, t, s21, s11):
+    def _store_data(self, t, s21, s11):
+        """Called constantly by ComputeThread. Keep this minimal."""
         self.last_t = t
         self.x_time.append(t)
         self.y21r.append(s21)
@@ -424,35 +502,47 @@ class VNA(QMainWindow):
         
         self.obj_history.append(self.meta_obj)
         self.height_history.append(self.meta_height)
+        self._needs_plot_update = True
 
-        x_arr = np.array(self.x_time)
+    def _update_plot(self):
+        """Called at 20fps by QTimer. Does the heavy UI math and drawing."""
+        if not self._needs_plot_update or not self.x_time:
+            return
+            
+        self._needs_plot_update = False
         
-        self.l21.set_data(x_arr, smooth_trace(np.array(self.y21r), SMOOTH_WIN21))
-        self.d21.set_data(x_arr, self.y21r)
+        # Snapshot the data arrays
+        x_arr = np.array(self.x_time)
+        y21_arr = np.array(self.y21r)
+        y11_arr = np.array(self.y11r)
+        
+        self.l21.set_data(x_arr, savgol_trace(y21_arr, SMOOTH_WIN21))
+        self.g21.set_data(x_arr, gaussian_trace(y21_arr, SMOOTH_WIN21))
+        self.d21.set_data(x_arr, y21_arr)
 
-        y_raw = np.array(self.y11r)
-        valid = np.isfinite(y_raw)
+        valid = np.isfinite(y11_arr)
         
         if valid.sum() >= 2:
-            y_filled = y_raw.copy()
-            y_filled[~valid] = np.interp(x_arr[~valid], x_arr[valid], y_raw[valid])
+            y_filled = y11_arr.copy()
+            y_filled[~valid] = np.interp(x_arr[~valid], x_arr[valid], y11_arr[valid])
         else:
-            y_filled = y_raw.copy()
+            y_filled = y11_arr.copy()
             
-        if self.cbSmooth.isChecked():
-            y_plot = smooth_trace(y_filled, SMOOTH_WIN11)
-        else:
-            y_plot = y_filled
+        y_plot_savgol = savgol_trace(y_filled, SMOOTH_WIN11)
+        y_plot_gauss = gaussian_trace(y_filled, SMOOTH_WIN11)
 
-        y_plot = np.minimum(y_plot, 0.0)
+        y_plot_savgol = np.minimum(y_plot_savgol, 0.0)
+        y_plot_gauss = np.minimum(y_plot_gauss, 0.0)
 
-        self.l11.set_data(x_arr, y_plot)
+        self.l11.set_data(x_arr, y_plot_savgol)
+        self.g11.set_data(x_arr, y_plot_gauss)
+        
         if self.cbRaw.isChecked():
-            self.d11.set_data(x_arr[valid], y_raw[valid])
+            self.d11.set_data(x_arr[valid], y11_arr[valid])
         else:
             self.d11.set_data([], [])
 
-        max_t = max(10, t * 1.05)
+        max_t = max(10, self.last_t * 1.05)
         for ax in (self.ax21, self.ax11):
             ax.set_xlim(0, max_t)
             ax.relim()
@@ -461,10 +551,16 @@ class VNA(QMainWindow):
         self.canvas.draw_idle()
 
     def _vis_toggle(self):
-        showS = self.cbSmooth.isChecked()
+        showS = self.cbSavGol.isChecked()
+        showG = self.cbGaussian.isChecked()
         showR = self.cbRaw.isChecked()
-        self.l21.set_visible(showS); self.l11.set_visible(showS)
-        self.d21.set_visible(showR); self.d11.set_visible(showR)
+        
+        self.l21.set_visible(showS)
+        self.l11.set_visible(showS)
+        self.g21.set_visible(showG)
+        self.g11.set_visible(showG)
+        self.d21.set_visible(showR)
+        self.d11.set_visible(showR)
         self.canvas.draw_idle()
 
     def _clear_markers(self):

@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-PlutoSDR VNA Data Plotter
+PlutoSDR VNA Data Plotter - Fixed Indexing
 =========================
-Reads the generated CSV files and reproduces the S21 and S11 vs Time plots,
-including reconstructing the metadata change markers.
 """
 
 import pandas as pd
@@ -12,102 +10,106 @@ import matplotlib.pyplot as plt
 import tkinter as tk
 from tkinter import filedialog
 import sys
+from scipy.signal import savgol_filter
 
-# --- Smoothing Function (same as the main app) ---
-def smooth_trace(y, k):
-    if k <= 1 or len(y) < k:
+def smooth_trace(y, k, polyorder=2, std=None):
+    if k <= polyorder or y.size < k:
         return y
-    y_arr = np.array(y)
-    mask = np.isfinite(y_arr).astype(float)
-    win = np.ones(k)
-    num = np.convolve(np.nan_to_num(y_arr), win, 'same')
-    den = np.convolve(mask, win, 'same')
-    out = np.full_like(y_arr, np.nan)
-    good = den > 0
-    out[good] = num[good] / den[good]
-    return out
+    window_length = k if k % 2 != 0 else k + 1
+    mask = np.isfinite(y)
+    if not np.any(mask):
+        return y
+    y_filled = y.copy()
+    x_indices = np.arange(len(y))
+    y_filled[~mask] = np.interp(x_indices[~mask], x_indices[mask], y[mask])
+    
+    if std is None:
+        std = max(k / 6.0, 1.0) 
+    n = np.arange(k) - (k - 1) / 2.0
+    gauss_win = np.exp(-0.5 * (n / std) ** 2)
+    gauss_win /= gauss_win.sum() 
+    
+    gauss_num = np.convolve(y_filled, gauss_win, 'same')
+    gauss_den = np.convolve(np.ones_like(y_filled), gauss_win, 'same')
+    y_gauss = gauss_num / gauss_den
+    return savgol_filter(y_gauss, window_length, polyorder)
 
 def main():
-    # Hide the main Tkinter window
     root = tk.Tk()
     root.withdraw()
 
-    # Open file dialog to pick the CSV
-    print("Please select a VNA CSV file to plot...")
     file_path = filedialog.askopenfilename(
         title="Select VNA Data CSV",
         filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
     )
 
     if not file_path:
-        print("No file selected. Exiting.")
         sys.exit(0)
 
-    print(f"Loading data from: {file_path}")
-    
-    # Read the data
     try:
         df = pd.read_csv(file_path)
     except Exception as e:
-        print(f"Error reading CSV: {e}")
+        print(f"Error: {e}")
         sys.exit(1)
 
-    # Validate columns
-    req_cols = ['Elapsed Time (s)', 'Frequency (Hz)', 'S11 (dB)', 'S21 (dB)', 'OBJ', 'Height (m)']
-    if not all(col in df.columns for col in req_cols):
-        print(f"Error: CSV is missing required columns. Expected: {req_cols}")
-        sys.exit(1)
-
-    # Extract data
     t = df['Elapsed Time (s)'].values
-    freq_hz = df['Frequency (Hz)'].iloc[0]
-    freq_mhz = freq_hz / 1e6
-    
+    freq_mhz = df['Frequency (Hz)'].iloc[0] / 1e6
     s21_raw = df['S21 (dB)'].values
     s11_raw = df['S11 (dB)'].values
     
-    s21_smooth = smooth_trace(s21_raw, 7)
-    s11_smooth = smooth_trace(s11_raw, 5)
+    # Smoothing
+    s21_smooth = smooth_trace(s21_raw, 20)
+    s11_smooth = smooth_trace(s11_raw, 20)
 
-    # Identify where metadata changed
-    meta_change_indices = []
-    for i in range(1, len(df)):
-        if (df['OBJ'].iloc[i] != df['OBJ'].iloc[i-1]) or (df['Height (m)'].iloc[i] != df['Height (m)'].iloc[i-1]):
-            meta_change_indices.append(i)
+    # Rolling Std Dev (Center=True uses 5 points before and 5 points after)
+    s21_std = pd.Series(s21_raw).rolling(window=11, center=True, min_periods=1).std().values
+    s11_std = pd.Series(s11_raw).rolling(window=11, center=True, min_periods=1).std().values
 
-    # Setup the plot
-    fig, (ax21, ax11) = plt.subplots(2, 1, figsize=(12, 9))
+    # Fixed Metadata Detection: Keep dimensions aligned
+    # .ne() compares with previous row. The first row is always True (different from NaN).
+    obj_changes = df['OBJ'].ne(df['OBJ'].shift())
+    h_changes = df['Height (m)'].ne(df['Height (m)'].shift())
+    
+    # We combine them and remove the very first index (0) so we don't mark the start of the file
+    combined_changes = obj_changes | h_changes
+    meta_change_indices = df.index[combined_changes].tolist()
+    if 0 in meta_change_indices:
+        meta_change_indices.remove(0)
 
-    # Plot S21
-    ax21.plot(t, s21_raw, 'ro', ms=3, alpha=0.3, label='S21 raw')
-    ax21.plot(t, s21_smooth, 'b-', lw=1.5, label='S21 smoothed')
-    ax21.set_title(f"S21 vs Time ({freq_mhz} MHz)")
+    # Plotting
+    fig, (ax21, ax11, ax_std) = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+
+    # S21 Plot
+    ax21.plot(t, s21_raw, 'ro', ms=3, alpha=0.2, label='S21 Raw')
+    ax21.plot(t, s21_smooth, 'b-', lw=1.5, label='S21 Smooth')
     ax21.set_ylabel("S21 (dB)")
-    ax21.grid(True)
+    ax21.grid(True, alpha=0.3)
     ax21.legend(loc='lower right')
 
-    # Plot S11
-    ax11.plot(t, s11_raw, 'mo', ms=3, alpha=0.3, label='S11 raw')
-    ax11.plot(t, s11_smooth, 'g-', lw=1.5, label='S11 smoothed')
-    ax11.set_title(f"S11 vs Time ({freq_mhz} MHz)")
+    # S11 Plot
+    ax11.plot(t, s11_raw, 'mo', ms=3, alpha=0.2, label='S11 Raw')
+    ax11.plot(t, s11_smooth, 'b-', lw=1.5, label='S11 Smooth')
     ax11.set_ylabel("S11 (dB)")
-    ax11.set_xlabel("Elapsed Time (s)")
-    ax11.grid(True)
+    ax11.grid(True, alpha=0.3)
     ax11.legend(loc='lower right')
 
-    # Add Metadata Markers
+    # Std Dev Plot
+    ax_std.plot(t, s21_std, 'r-', lw=1, label='S21 Std Dev (±5 pts)')
+    ax_std.plot(t, s11_std, 'm-', lw=1, label='S11 Std Dev (±5 pts)')
+    ax_std.set_ylabel("Std Dev (dB)")
+    ax_std.set_xlabel("Time (s)")
+    ax_std.grid(True, alpha=0.3)
+    ax_std.legend(loc='upper right')
+
+    # Add Markers
     for idx in meta_change_indices:
         change_t = t[idx]
-        obj_val = df['OBJ'].iloc[idx]
-        h_val = df['Height (m)'].iloc[idx]
-        label_text = f" Meta\n OBJ:{obj_val}\n H:{h_val}m"
-
-        for ax in (ax21, ax11):
-            ax.axvline(x=change_t, color='orange', linestyle='--', alpha=0.8)
-            # Add text annotation at the top of the graph
-            ax.text(change_t, 0.95, label_text, color='orange', 
-                    transform=ax.get_xaxis_transform(), va='top', ha='right', fontsize=8,
-                    bbox=dict(boxstyle="round,pad=0.2", fc='w', ec='orange', alpha=0.7))
+        label_text = f" OBJ:{df['OBJ'].iloc[idx]}\n H:{df['Height (m)'].iloc[idx]}m"
+        for i, ax in enumerate((ax21, ax11, ax_std)):
+            ax.axvline(x=change_t, color='orange', linestyle='--', alpha=0.7)
+            if i == 0:
+                ax.text(change_t, 0.98, label_text, color='darkorange', transform=ax.get_xaxis_transform(),
+                        va='top', ha='right', fontsize=8, bbox=dict(boxstyle="round", fc='w', ec='orange', alpha=0.8))
 
     plt.tight_layout()
     plt.show()
