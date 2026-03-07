@@ -40,9 +40,9 @@ sdr.tx_buffer_size          = NUM_S
 sdr.gain_control_mode_chan0 = "manual"
 sdr.gain_control_mode_chan1 = "manual"
 sdr.tx_cyclic_buffer        = True
-sdr.tx_hardwaregain_chan0   = -10
-sdr.rx_hardwaregain_chan0   = 50
-sdr.rx_hardwaregain_chan1   = 50
+sdr.tx_hardwaregain_chan0   = 0
+sdr.rx_hardwaregain_chan0   = 0
+sdr.rx_hardwaregain_chan1   = 0
 
 _t = np.arange(NUM_S) / FS
 sdr.tx((np.exp(2j * np.pi * TONE * _t) * (2**14)).astype(np.complex64))
