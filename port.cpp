@@ -25,7 +25,7 @@ const double FS           = 8e6;
 const size_t NUM_S        = 131072;
 const double TONE         = 543e3;
 const double EPS          = 1e-15;
-const double CAL_REF_DBFS = -14.4;   // ⚠️ Update with your direct-cable calibration value
+const double CAL_REF_DBFS = -10.6;   // ⚠️ Update with your direct-cable calibration value
 
 struct SdrData {
     std::vector<cf32> rx_complex;
