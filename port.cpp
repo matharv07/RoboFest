@@ -25,7 +25,7 @@ const double FS           = 8e6;
 const size_t NUM_S        = 131072;
 const double TONE         = 543e3;
 const double EPS          = 1e-15;
-const double CAL_REF_DBFS = -10.6;   // ⚠️ Update with your direct-cable calibration value
+const double CAL_REF_DBFS = 1.8;   // ⚠️ Update with your direct-cable calibration value
 
 struct SdrData {
     std::vector<cf32> rx_complex;
@@ -178,7 +178,7 @@ void processing_thread(long long freq_mhz, std::string obj, double height) {
     const int    MEDIAN_WIN    = 100;   // rolling baseline window (samples)
     const int    BASELINE_MIN  = 30;    // minimum samples before baseline is trusted
     const int    SG_HIST_WIN   = 5;     // window for local minima detection
-    const double DETECT_THRESH = 5.0;   // dB — abs(SG - baseline) to trigger detection
+    const double DETECT_THRESH = 8.0;   // dB — abs(SG - baseline) to trigger detection
 
     std::vector<double> GAUSS_COEFFS = generate_gaussian_kernel(GAUSS_WIN, GAUSS_SIGMA);
     const double SG_COEFFS[21] = {
